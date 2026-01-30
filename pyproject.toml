@@ -1,0 +1,13 @@
+[project]
+name = "penal-code-17"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "fountain",
+    "playscript>=0.2.8",
+]
+
+[tool.uv.sources]
+fountain = { git = "https://github.com/Tagirijus/fountain.git", rev = "7da5447abae640f34448dd36fee83f47a7415fcf" }
