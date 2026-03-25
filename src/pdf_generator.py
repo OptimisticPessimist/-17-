@@ -1,0 +1,905 @@
+"""PDF生成コアロジック（スタンドアロン版）"""
+import io
+import os
+from collections import namedtuple
+
+from playscript import PScLineType
+from playscript.conv import fountain
+from reportlab.lib.pagesizes import A4, A5, landscape, portrait
+from reportlab.lib.units import cm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen import canvas
+
+from fountain_utils import preprocess_fountain
+
+# Font registration
+_FONT_SEARCH_PATHS = [
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "ShipporiMincho-Regular.ttf"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "ShipporiMincho-Regular.ttf"),
+]
+
+try:
+    _registered = False
+    for _font_path in _FONT_SEARCH_PATHS:
+        if os.path.exists(_font_path):
+            pdfmetrics.registerFont(TTFont("ShipporiMincho", _font_path))
+            DEFAULT_FONT = "HeiseiMin-W3"
+            _registered = True
+            break
+    if not _registered:
+        pdfmetrics.registerFont(UnicodeCIDFont("HeiseiMin-W3"))
+        DEFAULT_FONT = "HeiseiMin-W3"
+except Exception:
+    pdfmetrics.registerFont(UnicodeCIDFont("HeiseiMin-W3"))
+    DEFAULT_FONT = "HeiseiMin-W3"
+
+_Size = namedtuple("Size", "w h")
+
+
+class CustomPageMan:
+    """縦書きPDF ストリーム生成クラス"""
+
+    def __init__(
+        self,
+        size,
+        margin=None,
+        upper_space=None,
+        font_name="HeiseiMin-W3",
+        num_font_name="Times-Roman",
+        font_size=10.0,
+        line_space=None,
+        before_init_page=None,
+    ):
+        self.size = _Size(*size)
+        self.font_name = font_name
+        self.num_font_name = num_font_name
+        self.font_size = font_size
+        self.before_init_page = before_init_page
+
+        self.margin = _Size(*margin) if margin else _Size(2 * cm, 2 * cm)
+        self.upper_space = self.size.h / 4 if upper_space is None else upper_space
+        self.line_space = self.font_size * 0.95 if line_space is None else line_space
+
+        self.pdf = io.BytesIO()
+        self.canvas = canvas.Canvas(self.pdf, pagesize=self.size)
+        self._init_page()
+
+    def _get_line_x(self, l_idx):
+        x = self.size.w - self.margin.w - self.font_size / 2
+        x = x - l_idx * (self.font_size + self.line_space)
+        return x
+
+    def _get_line_y(self, indent):
+        y = self.size.h - self.margin.h - self.upper_space - indent
+        return y
+
+    def _max_line_count(self):
+        area_w = self.size.w - 2 * self.margin.w + self.line_space
+        count = area_w // (self.font_size + self.line_space)
+        return int(count)
+
+    def _calc_lines_needed(self, text, indent=None, first_indent=None):
+        if indent is None:
+            indent = self.font_size
+        if first_indent is None:
+            first_indent = indent
+
+        total = 0
+        is_first_column = True
+        for t in text.splitlines():
+            remaining = t
+            while remaining:
+                line_indent = first_indent if is_first_column else indent
+                height = self.size.h - 2 * self.margin.h - self.upper_space - line_indent
+                max_len = max(1, int(height // self.font_size))
+                if len(remaining) > max_len and remaining[max_len] in "、。」":
+                    max_len += 1
+                    if len(remaining) > max_len and remaining[max_len] == "」":
+                        max_len -= 2
+                    max_len = max(1, max_len)
+                if max_len > 0 and max_len < len(remaining) and remaining[max_len - 1] == "…" and remaining[max_len] == "…":
+                    max_len = max(1, max_len - 1)
+                total += 1
+                remaining = remaining[max_len:]
+                is_first_column = False
+        return total
+
+    def _init_page(self):
+        if self.before_init_page:
+            self.before_init_page(self)
+
+        x1 = self.margin.w - self.line_space
+        x2 = self.size.w - self.margin.w + self.line_space
+        y = self.size.h - self.margin.h - self.upper_space
+        self.canvas.setLineWidth(0.1)
+        self.canvas.line(x1, y, x2, y)
+
+        self.canvas.setFont(self.font_name, self.font_size)
+
+    def _commit_page(self):
+        self.canvas.showPage()
+
+    def force_page_break(self):
+        self._commit_page()
+        self._init_page()
+        return 0
+
+    def close(self):
+        self._commit_page()
+        self.canvas.save()
+        self.pdf.seek(0)
+
+    def _draw_line(self, l_idx, text, indent=None, is_bold=False):
+        if indent is None:
+            indent = self.font_size
+
+        x = self._get_line_x(l_idx)
+        y = self._get_line_y(indent)
+
+        height = self.size.h - 2 * self.margin.h - self.upper_space - indent
+        max_len = max(1, int(height // self.font_size))
+
+        if len(text) > max_len and text[max_len] in "、。」":
+            max_len += 1
+            if len(text) > max_len and text[max_len] == "」":
+                max_len -= 2
+        if max_len > 0 and max_len < len(text) and text[max_len - 1] == "…" and text[max_len] == "…":
+            max_len = max(1, max_len - 1)
+
+        if is_bold:
+            self.canvas.saveState()
+            self.canvas.setLineWidth(self.font_size * 0.03)
+            self.canvas._code.append("2 Tr")
+
+        self.canvas.drawString(x, y, text[:max_len])
+
+        if is_bold:
+            self.canvas.restoreState()
+
+        return text[max_len:]
+
+    def _draw_lines(self, l_idx, lines, indent=None, first_indent=None, is_bold=False):
+        if not first_indent:
+            first_indent = indent
+
+        texts = lines.splitlines()
+        first_line = True
+
+        for text in texts:
+            line = text
+            while len(line) > 0:
+                if l_idx >= self._max_line_count():
+                    self.force_page_break()
+                    l_idx = 0
+
+                line_indent = first_indent if first_line else indent
+                line = self._draw_line(l_idx, line, indent=line_indent, is_bold=is_bold)
+                first_line = False
+                l_idx += 1
+        return l_idx
+
+    def _draw_single_line(self, l_idx, line, indent=None):
+        if l_idx >= self._max_line_count():
+            self.force_page_break()
+            l_idx = 0
+        _ = self._draw_line(l_idx, line, indent=indent)
+        return l_idx + 1
+
+    def _draw_line_bottom(self, l_idx, line):
+        indent = self.font_size
+        height = self.size.h - 2 * self.margin.h - self.upper_space - indent
+        max_len = int(height // self.font_size)
+        line = line[:max_len]
+        indent += (max_len - len(line)) * self.font_size
+        l_idx = self._draw_single_line(l_idx, line, indent=indent)
+        return l_idx
+
+    def draw_title(self, l_idx, ttl_line):
+        indent = self.font_size * 7
+        l_idx = self._draw_lines(l_idx, ttl_line.text, indent=indent, is_bold=True)
+        return l_idx
+
+    def draw_author(self, l_idx, athr_line):
+        self._draw_line_bottom(l_idx, athr_line.text)
+        return l_idx + 1
+
+    def draw_charsheadline(self, l_idx, chead_line):
+        indent = self.font_size * 8
+        l_idx = self._draw_single_line(l_idx, chead_line.text, indent=indent)
+        return l_idx
+
+    def _draw_character_entry(self, l_idx, name, text, name_col_width=4):
+        padded_name = name + "　" * max(0, name_col_width - len(name))
+        first_indent = self.font_size * 7
+        desc_indent = first_indent + (name_col_width + 1) * self.font_size
+        combined = padded_name + "　" + text if text else padded_name
+        return self._draw_lines(l_idx, combined, indent=desc_indent, first_indent=first_indent)
+
+    def draw_character(self, l_idx, char_line, name_col_width=4):
+        name = char_line.name.lstrip("!").rstrip("：")
+        text = (char_line.text if hasattr(char_line, "text") else "").lstrip("!").lstrip("：")
+        return self._draw_character_entry(l_idx, name, text, name_col_width)
+
+    def draw_direction_as_character(self, l_idx, raw_text, name_col_width=4):
+        text = raw_text.lstrip("!")
+        if "：" in text:
+            name, desc = text.split("：", 1)
+        elif ": " in text:
+            name, desc = text.split(": ", 1)
+        elif "　" in text:
+            name, desc = text.split("　", 1)
+        else:
+            name, desc = text, ""
+        return self._draw_character_entry(l_idx, name.strip(), desc.strip(), name_col_width)
+
+    def draw_slugline(self, l_idx, hx_line, number=None, border=False):
+        l_idx = self._draw_single_line(l_idx, hx_line.text)
+        if border:
+            x = self._get_line_x(l_idx - 1)
+            x1 = x + self.font_size / 2 + self.line_space * 0.8
+            x2 = x - self.font_size / 2 - self.line_space * 0.8
+            y1 = self._get_line_y(-(self.font_size * 3))
+            y2 = self.margin.h - self.font_size
+            self.canvas.setLineWidth(0.1)
+            self.canvas.line(x1, y1, x1, y2)
+            self.canvas.line(x1, y1, x2, y1)
+            self.canvas.line(x2, y1, x2, y2)
+        if number is not None:
+            num_str = str(number)
+            w = self.canvas.stringWidth(num_str, self.num_font_name, self.font_size)
+            x = self._get_line_x(l_idx - 1) - w / 2
+            y = self._get_line_y(-self.font_size)
+            self.canvas.setFont(self.num_font_name, self.font_size)
+            self.canvas.drawString(x, y, num_str)
+            self.canvas.setFont(self.font_name, self.font_size)
+        return l_idx
+
+    def draw_direction(self, l_idx, drct_line):
+        indent = self.font_size * 7
+        text = drct_line.text.lstrip("!")
+        l_idx = self._draw_lines(l_idx, text, indent=indent)
+        return l_idx
+
+    def draw_synopsis_text(self, l_idx, text):
+        indent = self.font_size * 4
+        paragraphs = text.lstrip("!").splitlines()
+        indented = "\n".join("　" + p if p.strip() else p for p in paragraphs)
+        l_idx = self._draw_lines(l_idx, indented, indent=indent)
+        return l_idx
+
+    def draw_dialogue(self, l_idx, dlg_line):
+        name = dlg_line.name
+        text = dlg_line.text
+        if len(name) == 1:
+            name = " " + name + " "
+        elif len(name) == 2:
+            name = name[0] + " " + name[1]
+        text = name + "「" + text + "」"
+        first_indent = self.font_size * 1
+        indent = self.font_size * 5
+        needed = self._calc_lines_needed(text, indent=indent, first_indent=first_indent)
+        if self._max_line_count() - l_idx < needed:
+            l_idx = self.force_page_break()
+        l_idx = self._draw_lines(l_idx, text, indent=indent, first_indent=first_indent)
+        return l_idx
+
+    def draw_endmark(self, l_idx, endmk_line):
+        self._draw_line_bottom(l_idx, endmk_line.text)
+        return l_idx + 1
+
+    def draw_comment(self, l_idx, cmmt_line):
+        indent = self.font_size * 7
+        l_idx = self._draw_lines(l_idx, cmmt_line.text, indent=indent)
+        return l_idx
+
+    def draw_empty(self, l_idx, empty_line):
+        l_idx = self._draw_single_line(l_idx, "")
+        return l_idx
+
+
+class HorizontalPageMan:
+    """横書きPDF ストリーム生成クラス"""
+
+    def __init__(
+        self,
+        size,
+        margin=None,
+        font_name="HeiseiMin-W3",
+        num_font_name="Times-Roman",
+        font_size=10.0,
+        line_height=None,
+        before_init_page=None,
+    ):
+        self.size = _Size(*size)
+        self.font_name = font_name
+        self.num_font_name = num_font_name
+        self.font_size = font_size
+        self.before_init_page = before_init_page
+
+        self.margin = _Size(*margin) if margin else _Size(2 * cm, 2 * cm)
+        self.line_height = line_height if line_height else self.font_size * 1.8
+
+        self.pdf = io.BytesIO()
+        self.canvas = canvas.Canvas(self.pdf, pagesize=self.size)
+        self.current_y = 0
+        self._init_page()
+
+    def _usable_width(self):
+        return self.size.w - 2 * self.margin.w
+
+    def _usable_height(self):
+        return self.size.h - 2 * self.margin.h
+
+    def _calc_lines_needed(self, text, x_offset=0):
+        max_chars = max(1, int(self._usable_width() - x_offset) // int(self.font_size))
+        total = 0
+        for line_text in text.splitlines():
+            if not line_text:
+                total += 1
+                continue
+            remaining = line_text
+            while remaining:
+                cut = min(max_chars, len(remaining))
+                if cut < len(remaining) and remaining[cut] in "、。」":
+                    cut += 1
+                    if cut < len(remaining) and remaining[cut] == "」":
+                        cut -= 2
+                    cut = max(1, cut)
+                if cut > 0 and cut < len(remaining) and remaining[cut - 1] == "…" and remaining[cut] == "…":
+                    cut = max(1, cut - 1)
+                total += 1
+                remaining = remaining[cut:]
+        return max(total, 1)
+
+    def _init_page(self):
+        if self.before_init_page:
+            self.before_init_page(self)
+        self.current_y = self.size.h - self.margin.h
+        self.canvas.setFont(self.font_name, self.font_size)
+
+    def _commit_page(self):
+        self.canvas.showPage()
+
+    def force_page_break(self):
+        self._commit_page()
+        self._init_page()
+
+    def _check_page_break(self, needed_height=None):
+        if needed_height is None:
+            needed_height = self.line_height
+        if self.current_y - needed_height < self.margin.h:
+            self.force_page_break()
+
+    def close(self):
+        self._commit_page()
+        self.canvas.save()
+        self.pdf.seek(0)
+
+    def _draw_text_line(self, text, x_offset=0, is_bold=False):
+        self._check_page_break()
+        x = self.margin.w + x_offset
+        y = self.current_y - self.font_size
+
+        if is_bold:
+            self.canvas.saveState()
+            self.canvas.setLineWidth(self.font_size * 0.03)
+            self.canvas._code.append("2 Tr")
+
+        self.canvas.drawString(x, y, text)
+
+        if is_bold:
+            self.canvas.restoreState()
+
+        self.current_y -= self.line_height
+
+    def _draw_wrapped_text(self, text, x_offset=0, cont_x_offset=None, is_bold=False):
+        if cont_x_offset is None:
+            cont_x_offset = x_offset
+        first = True
+
+        for line_text in text.splitlines():
+            remaining = line_text
+            while len(remaining) > 0:
+                cur_x = x_offset if first else cont_x_offset
+                max_chars = max(1, int(self._usable_width() - cur_x) // int(self.font_size))
+                cut = min(max_chars, len(remaining))
+                if cut < len(remaining) and remaining[cut] in "、。」":
+                    cut += 1
+                    if cut < len(remaining) and remaining[cut] == "」":
+                        cut -= 2
+                    cut = max(1, cut)
+                if cut > 0 and cut < len(remaining) and remaining[cut - 1] == "…" and remaining[cut] == "…":
+                    cut = max(1, cut - 1)
+                self._draw_text_line(remaining[:cut], x_offset=cur_x, is_bold=is_bold)
+                remaining = remaining[cut:]
+                first = False
+
+    def draw_title(self, ttl_line):
+        self.canvas.setFont(self.font_name, self.font_size * 1.6)
+        title_text = ttl_line.text
+        text_width = self.canvas.stringWidth(title_text, self.font_name, self.font_size * 1.6)
+        x = (self.size.w - text_width) / 2
+        y = self.current_y - self.font_size * 1.6
+
+        self.canvas.saveState()
+        self.canvas.setLineWidth(self.font_size * 0.05)
+        self.canvas._code.append("2 Tr")
+        self.canvas.drawString(x, y, title_text)
+        self.canvas.restoreState()
+
+        self.canvas.setFont(self.font_name, self.font_size)
+        self.current_y -= self.line_height * 2
+
+    def draw_author(self, text):
+        lines = text.splitlines()
+        for line in lines:
+            text_width = self.canvas.stringWidth(line, self.font_name, self.font_size)
+            x = (self.size.w - text_width) / 2
+            self._check_page_break()
+            self.canvas.drawString(x, self.current_y - self.font_size, line)
+            self.current_y -= self.line_height
+
+    def draw_charsheadline(self, chead_line):
+        self._draw_text_line(chead_line.text, is_bold=True)
+
+    def _draw_character_entry(self, name, text, name_col_width=4):
+        padded_name = name + "　" * max(0, name_col_width - len(name))
+        base_x = self.font_size * 2
+        desc_x = base_x + (name_col_width + 1) * self.font_size
+        if text:
+            combined = padded_name + "　" + text
+            self._draw_wrapped_text(combined, x_offset=base_x, cont_x_offset=desc_x)
+        else:
+            self._draw_text_line(padded_name, x_offset=base_x)
+
+    def draw_character(self, char_line, name_col_width=4):
+        name = char_line.name.lstrip("!").rstrip("：")
+        text = (char_line.text if hasattr(char_line, "text") else "").lstrip("!").lstrip("：")
+        self._draw_character_entry(name, text, name_col_width)
+
+    def draw_direction_as_character(self, raw_text, name_col_width=4):
+        text = raw_text.lstrip("!")
+        if "：" in text:
+            name, desc = text.split("：", 1)
+        elif "　" in text:
+            name, desc = text.split("　", 1)
+        else:
+            name, desc = text, ""
+        self._draw_character_entry(name.strip(), desc.strip(), name_col_width)
+
+    def draw_slugline(self, hx_line, number=None, border=False):
+        self.current_y -= self.line_height * 0.5
+        self._check_page_break()
+
+        display = hx_line.text
+        if number is not None:
+            display = f"{number}. {display}"
+
+        if border:
+            x1 = self.margin.w
+            x2 = self.size.w - self.margin.w
+            y = self.current_y - self.font_size - 2
+            self.canvas.setLineWidth(0.5)
+            self.canvas.line(x1, y, x2, y)
+
+        self._draw_text_line(display, is_bold=True)
+        if border:
+            self.current_y -= self.line_height * 0.3
+
+    def draw_direction(self, drct_line):
+        text = drct_line.text.lstrip("!")
+        self._draw_wrapped_text(text, x_offset=self.font_size * 4)
+
+    def draw_synopsis_text(self, text):
+        paragraphs = text.lstrip("!").splitlines()
+        indented = "\n".join("　" + p if p.strip() else p for p in paragraphs)
+        self._draw_wrapped_text(indented, x_offset=0)
+
+    def draw_dialogue(self, dlg_line):
+        name = dlg_line.name
+        text = dlg_line.text
+        dialogue_text = f"「{text}」"
+        total_height = self.line_height + self._calc_lines_needed(dialogue_text, x_offset=self.font_size * 4) * self.line_height
+        if self.current_y - self.margin.h < total_height:
+            self.force_page_break()
+        self._draw_text_line(f"  {name}", x_offset=self.font_size * 2, is_bold=True)
+        self._draw_wrapped_text(dialogue_text, x_offset=self.font_size * 4)
+
+    def draw_endmark(self, endmk_line):
+        self._check_page_break()
+        text = endmk_line.text
+        text_width = self.canvas.stringWidth(text, self.font_name, self.font_size)
+        x = self.size.w - self.margin.w - text_width
+        self.canvas.drawString(x, self.current_y - self.font_size, text)
+        self.current_y -= self.line_height
+
+    def draw_comment(self, cmmt_line):
+        self._draw_wrapped_text(cmmt_line.text, x_offset=self.font_size * 4)
+
+    def draw_empty(self):
+        self.current_y -= self.line_height
+
+
+def _extract_char_name(text):
+    t = text.lstrip("!")
+    if "：" in t:
+        return t.split("：", 1)[0].strip()
+    if ": " in t:
+        return t.split(": ", 1)[0].strip()
+    if "　" in t:
+        return t.split("　", 1)[0].strip()
+    return t.strip()
+
+
+def _get_h2_letter(h2_count):
+    if h2_count < 1:
+        return ""
+    h2_letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    max_num = len(h2_letters)
+    q = (h2_count - 1) // max_num
+    s = (h2_count - 1) % max_num
+    return _get_h2_letter(q) + h2_letters[s]
+
+
+def custom_psc_to_pdf(
+    psc,
+    size=None,
+    margin=None,
+    upper_space=None,
+    font_name="HeiseiMin-W3",
+    num_font_name="Times-Roman",
+    font_size=10.0,
+    line_space=None,
+    before_init_page=None,
+    draw_page_num=True,
+):
+    def custom_init(pm):
+        if before_init_page:
+            before_init_page(pm)
+        if draw_page_num:
+            if hasattr(pm, "page_num"):
+                pm.page_num += 1
+            else:
+                pm.page_num = 1
+            s = f"- {pm.page_num} -"
+            f_name = pm.num_font_name
+            f_size = pm.font_size * 0.8
+            w = pm.canvas.stringWidth(s, f_name, f_size)
+            pm.canvas.setFont(f_name, f_size)
+            x = pm.size.w / 2 - w / 2
+            y = pm.margin.h / 2
+            pm.canvas.drawString(x, y, s)
+
+    pdfmetrics.registerFont(UnicodeCIDFont(font_name, isVertical=True))
+
+    if not size:
+        size = portrait(A5)
+    if not margin:
+        margin = (2.0 * cm, 2.0 * cm)
+
+    pm = CustomPageMan(
+        size,
+        margin=margin,
+        upper_space=upper_space,
+        font_name=font_name,
+        num_font_name=num_font_name,
+        font_size=font_size,
+        line_space=line_space,
+        before_init_page=custom_init,
+    )
+
+    last_line_type = None
+    h1_count = h2_count = 0
+    l_idx = 0
+
+    in_synopsis = False
+    in_character_section = False
+
+    _in_char_scan = False
+    char_name_col_width = 2
+    for _line in psc.lines:
+        if _line.type == PScLineType.CHARSHEADLINE:
+            _in_char_scan = True
+        elif _line.type in (PScLineType.H1, PScLineType.H2):
+            _in_char_scan = False
+        elif _line.type == PScLineType.CHARACTER:
+            char_name_col_width = max(char_name_col_width, len(_line.name.lstrip("!").rstrip("：")))
+        elif _in_char_scan and _line.type == PScLineType.DIRECTION:
+            char_name_col_width = max(char_name_col_width, len(_extract_char_name(_line.text)))
+
+    for _, psc_line in enumerate(psc.lines):
+        line_type = psc_line.type
+
+        if line_type == PScLineType.CHARSHEADLINE:
+            in_character_section = True
+        elif line_type in (PScLineType.H1, PScLineType.H2):
+            in_character_section = False
+
+        if line_type == PScLineType.H1:
+            if "あらすじ" in psc_line.text or "Synopsis" in psc_line.text:
+                in_synopsis = True
+            else:
+                in_synopsis = False
+
+        if last_line_type and (last_line_type != line_type):
+            if not (last_line_type == PScLineType.TITLE and line_type == PScLineType.AUTHOR):
+                l_idx += 1
+
+        if line_type == PScLineType.TITLE:
+            l_idx = pm.draw_title(l_idx, psc_line)
+        elif line_type == PScLineType.AUTHOR:
+            indent = pm.font_size * 4
+            l_idx = pm._draw_lines(l_idx, psc_line.text, indent=indent)
+            l_idx = pm.force_page_break()
+        elif line_type == PScLineType.CHARSHEADLINE:
+            l_idx = pm.draw_charsheadline(l_idx, psc_line)
+        elif line_type == PScLineType.CHARACTER:
+            if in_character_section:
+                raw = psc_line.name + ("　" + psc_line.text if psc_line.text else "")
+                l_idx = pm.draw_direction_as_character(l_idx, raw, name_col_width=char_name_col_width)
+            else:
+                l_idx = pm.draw_character(l_idx, psc_line, name_col_width=char_name_col_width)
+        elif line_type == PScLineType.H1:
+            if in_synopsis:
+                l_idx = pm.draw_slugline(l_idx, psc_line, number=None, border=True)
+            else:
+                h1_count += 1
+                h2_count = 0
+                l_idx = pm.draw_slugline(l_idx, psc_line, number=h1_count, border=True)
+        elif line_type == PScLineType.H2:
+            h2_count += 1
+            number = str(h1_count) + _get_h2_letter(h2_count)
+            l_idx = pm.draw_slugline(l_idx, psc_line, number=number)
+        elif line_type == PScLineType.H3:
+            l_idx = pm.draw_slugline(l_idx, psc_line)
+        elif line_type == PScLineType.DIRECTION:
+            if in_synopsis:
+                l_idx = pm.draw_synopsis_text(l_idx, psc_line.text)
+            elif in_character_section:
+                l_idx = pm.draw_direction_as_character(l_idx, psc_line.text, name_col_width=char_name_col_width)
+            else:
+                l_idx = pm.draw_direction(l_idx, psc_line)
+        elif line_type == PScLineType.DIALOGUE:
+            if in_synopsis:
+                l_idx = pm.draw_synopsis_text(l_idx, psc_line.text)
+            else:
+                l_idx = pm.draw_dialogue(l_idx, psc_line)
+        elif line_type == PScLineType.ENDMARK:
+            l_idx = pm.draw_endmark(l_idx, psc_line)
+        elif line_type == PScLineType.COMMENT:
+            l_idx = pm.draw_comment(l_idx, psc_line)
+        elif line_type == PScLineType.EMPTY:
+            l_idx = pm.draw_empty(l_idx, psc_line)
+
+        last_line_type = line_type
+
+    pm.close()
+    return pm.pdf
+
+
+def horizontal_psc_to_pdf(
+    psc,
+    size=None,
+    margin=None,
+    font_name="HeiseiMin-W3",
+    num_font_name="Times-Roman",
+    font_size=10.0,
+    line_height=None,
+    before_init_page=None,
+    draw_page_num=True,
+):
+    def horizontal_init(pm):
+        if before_init_page:
+            before_init_page(pm)
+        if draw_page_num:
+            if hasattr(pm, "page_num"):
+                pm.page_num += 1
+            else:
+                pm.page_num = 1
+            s = f"- {pm.page_num} -"
+            f_name = pm.num_font_name
+            f_size = pm.font_size * 0.8
+            w = pm.canvas.stringWidth(s, f_name, f_size)
+            pm.canvas.setFont(f_name, f_size)
+            x = pm.size.w / 2 - w / 2
+            y = pm.margin.h / 2
+            pm.canvas.drawString(x, y, s)
+
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont(font_name, isVertical=False))
+    except Exception:
+        pass
+
+    if not size:
+        size = portrait(A4)
+    if not margin:
+        margin = (2.0 * cm, 2.0 * cm)
+
+    pm = HorizontalPageMan(
+        size,
+        margin=margin,
+        font_name=font_name,
+        num_font_name=num_font_name,
+        font_size=font_size,
+        line_height=line_height,
+        before_init_page=horizontal_init,
+    )
+
+    last_line_type = None
+    h1_count = h2_count = 0
+    in_synopsis = False
+
+    _in_char_scan2 = False
+    char_name_col_width = 2
+    for _line in psc.lines:
+        if _line.type == PScLineType.CHARSHEADLINE:
+            _in_char_scan2 = True
+        elif _line.type in (PScLineType.H1, PScLineType.H2):
+            _in_char_scan2 = False
+        elif _line.type == PScLineType.CHARACTER:
+            char_name_col_width = max(char_name_col_width, len(_line.name.lstrip("!").rstrip("：")))
+        elif _in_char_scan2 and _line.type == PScLineType.DIRECTION:
+            char_name_col_width = max(char_name_col_width, len(_extract_char_name(_line.text)))
+
+    in_character_section = False
+
+    for i, psc_line in enumerate(psc.lines):
+        line_type = psc_line.type
+
+        if line_type == PScLineType.CHARSHEADLINE:
+            in_character_section = True
+        elif line_type in (PScLineType.H1, PScLineType.H2):
+            in_character_section = False
+
+        if line_type == PScLineType.H1:
+            if "あらすじ" in psc_line.text or "Synopsis" in psc_line.text:
+                in_synopsis = True
+            else:
+                in_synopsis = False
+
+        if last_line_type and (last_line_type != line_type):
+            if not (last_line_type == PScLineType.TITLE and line_type == PScLineType.AUTHOR):
+                pm.draw_empty()
+
+        if line_type == PScLineType.TITLE:
+            pm.draw_title(psc_line)
+        elif line_type == PScLineType.AUTHOR:
+            pm.draw_author(psc_line.text)
+            pm.force_page_break()
+        elif line_type == PScLineType.CHARSHEADLINE:
+            pm.draw_charsheadline(psc_line)
+        elif line_type == PScLineType.CHARACTER:
+            if in_character_section:
+                raw = psc_line.name + ("　" + psc_line.text if psc_line.text else "")
+                pm.draw_direction_as_character(raw, name_col_width=char_name_col_width)
+            else:
+                pm.draw_character(psc_line, name_col_width=char_name_col_width)
+        elif line_type == PScLineType.H1:
+            if in_synopsis:
+                pm.draw_slugline(psc_line, number=None, border=True)
+            else:
+                h1_count += 1
+                h2_count = 0
+                pm.draw_slugline(psc_line, number=h1_count, border=True)
+        elif line_type == PScLineType.H2:
+            h2_count += 1
+            number = str(h1_count) + _get_h2_letter(h2_count)
+            pm.draw_slugline(psc_line, number=number)
+        elif line_type == PScLineType.H3:
+            pm.draw_slugline(psc_line)
+        elif line_type == PScLineType.DIRECTION:
+            if in_synopsis:
+                pm.draw_synopsis_text(psc_line.text)
+            elif in_character_section:
+                pm.draw_direction_as_character(psc_line.text, name_col_width=char_name_col_width)
+            else:
+                pm.draw_direction(psc_line)
+        elif line_type == PScLineType.DIALOGUE:
+            if in_synopsis:
+                pm.draw_synopsis_text(psc_line.text)
+            else:
+                pm.draw_dialogue(psc_line)
+        elif line_type == PScLineType.ENDMARK:
+            pm.draw_endmark(psc_line)
+        elif line_type == PScLineType.COMMENT:
+            pm.draw_comment(psc_line)
+        elif line_type == PScLineType.EMPTY:
+            pm.draw_empty()
+
+        last_line_type = line_type
+
+    pm.close()
+    return pm.pdf
+
+
+def generate_script_pdf(
+    fountain_content: str,
+    orientation: str = "landscape",
+    writing_direction: str = "vertical",
+) -> bytes:
+    """Fountain形式のテキストからPDFを生成する.
+
+    Args:
+        fountain_content: Fountain形式の台本テキスト
+        orientation: 用紙の向き ("landscape" or "portrait")
+        writing_direction: 文字方向 ("vertical" or "horizontal")
+
+    Returns:
+        PDF バイナリデータ
+    """
+    from fountain.fountain import Fountain
+
+    fountain_content = preprocess_fountain(fountain_content)
+
+    f_parser = Fountain(fountain_content)
+    metadata = f_parser.metadata
+
+    script = fountain.psc_from_fountain(fountain_content)
+
+    metadata_parts = []
+
+    authors = metadata.get("author", [])
+    if authors:
+        metadata_parts.append(f"Author: {', '.join(authors)}")
+    if "date" in metadata:
+        metadata_parts.append(f"Date: {', '.join(metadata['date'])}")
+    if "draft date" in metadata:
+        metadata_parts.append(f"Draft: {', '.join(metadata['draft date'])}")
+    if "revision" in metadata:
+        metadata_parts.append(f"Rev: {', '.join(metadata['revision'])}")
+    if "copyright" in metadata:
+        metadata_parts.append(f"(c) {', '.join(metadata['copyright'])}")
+    if "contact" in metadata:
+        contact = "\n".join(metadata["contact"])
+        metadata_parts.append(f"Contact:\n{contact}")
+    if "notes" in metadata:
+        notes = "\n".join(metadata["notes"])
+        metadata_parts.append(f"Note:\n{notes}")
+
+    final_metadata_str = "\n".join(metadata_parts)
+
+    if final_metadata_str:
+        from playscript import PScLine, PScLineType
+
+        new_lines = []
+        found_title = False
+        author_injected = False
+
+        for line in script.lines:
+            if line.type == PScLineType.TITLE:
+                found_title = True
+                new_lines.append(line)
+            elif line.type == PScLineType.AUTHOR:
+                line.text = final_metadata_str
+                new_lines.append(line)
+                author_injected = True
+            else:
+                if found_title and not author_injected:
+                    author_line = PScLine(type=PScLineType.AUTHOR, text=final_metadata_str)
+                    new_lines.append(author_line)
+                    author_injected = True
+                new_lines.append(line)
+
+        if not found_title and not author_injected:
+            author_line = PScLine(type=PScLineType.AUTHOR, text=final_metadata_str)
+            new_lines.insert(0, author_line)
+        if found_title and not author_injected:
+            author_line = PScLine(type=PScLineType.AUTHOR, text=final_metadata_str)
+            new_lines.append(author_line)
+
+        script.lines = new_lines
+
+    if orientation == "portrait":
+        page_size = portrait(A4)
+    else:
+        page_size = landscape(A4)
+
+    if writing_direction == "horizontal":
+        pdf_stream = horizontal_psc_to_pdf(script, font_name=DEFAULT_FONT, size=page_size)
+    else:
+        pdfmetrics.registerFont(UnicodeCIDFont(DEFAULT_FONT, isVertical=True))
+        pdf_stream = custom_psc_to_pdf(script, font_name=DEFAULT_FONT, size=page_size)
+
+    return pdf_stream.getvalue()
