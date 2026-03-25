@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv python:*)",
+      "Bash(uv sync:*)",
+      "Bash(python ./src/generate_pdf.py ./books/chapter17.fountain --direction vertical --orientation portrait -o ./out/scenario.pdf)",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(timeout 10 python -c \"import sys; sys.path.insert\\(0, ''src''\\); from pdf_generator import generate_script_pdf; print\\(''import OK''\\)\")",
+      "Bash(timeout 10 python -c \":*)",
+      "Bash(timeout 30 python -c \":*)",
+      "Bash(timeout 15 python -c \":*)"
+    ]
+  }
+}
